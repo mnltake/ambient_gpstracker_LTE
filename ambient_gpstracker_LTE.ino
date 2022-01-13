@@ -11,17 +11,18 @@ TinyGsm        modem(SerialAT);
 TinyGsmClient client(modem);
 TinyGPSPlus gps;
 
-#define PERIOD 30
+long period ;
 
 const char apn[]  = "povo.jp";
 const char gprsUser[] = "";
 const char gprsPass[] = "";
 
+
 unsigned int channelId = 100; // AmbientのチャネルID
 const char* writeKey = "writeKey"; // ライトキー
 Ambient ambient;
 
-double lat=0.0, lng=0.0 ,alt;
+double lat=0.0, lng=0.0 ,alt ,spd=60;
 
 void setup() {
   M5.begin();//default baud rate 115200
@@ -74,6 +75,7 @@ void loop(){
 
     unsigned long t = millis();
     float uptime;
+    char latbuf[12], lngbuf[12],altbuf[8],spdbuf[7];
     // 起動時間を送信する
     uptime = (float)millis()/1000;
     ambient.set(1, String(uptime).c_str());// 1番目のデーターとしてuptimeをセット
@@ -96,14 +98,24 @@ void loop(){
             Serial.print(F("INVALID"));
           } 
           Serial.println();
-    char latbuf[12], lngbuf[12],altbuf[8];
-    if (!(lat || lng)){
+          if (gps.speed.isValid()){
+            spd = gps.speed.kmph();
+            Serial.print(spd,6);
+          }else{
+            Serial.print(F("INVALID"));
+          } 
+          Serial.println();
+          
+   
+    if (lat && lng){
       dtostrf(lat, 11, 7, latbuf);
       ambient.set(9, latbuf); // 9番目のデーターとして緯度をセット
       dtostrf(lng, 11, 7, lngbuf);
       ambient.set(10, lngbuf); // 10番目のデーターとして経度をセット
       dtostrf(alt, 7 ,2, altbuf);
       ambient.set(2, altbuf); // 2番目のデーターとして高さをセット
+      dtostrf(spd, 6 ,2, spdbuf);
+      ambient.set(3, spdbuf); // 3番目のデーターとしてspeedをセット
     }
     M5.Lcd.fillScreen(BLACK);
 
@@ -115,6 +127,7 @@ void loop(){
     M5.Lcd.printf("lng:%.6f", lng);
     M5.Lcd.setCursor(5,60);
     M5.Lcd.printf("alt:%.2f", alt);
+    M5.Lcd.printf(":%.2f", spd);
     modem.gprsConnect("povo.jp", "", "");
     while (!modem.isNetworkConnected()) SerialMon.print(".");
     SerialMon.print(F("My IP addr: "));
@@ -122,10 +135,21 @@ void loop(){
     SerialMon.println(ipaddr);
     M5.Lcd.setCursor(5,0);
     M5.Lcd.println(ipaddr);
-    SerialMon.println(" connect");
-    (ambient.send())? Serial.println("send ok") : Serial.println("send error");
-
-    t = millis() - t;
-    t = (t < PERIOD * 1000) ? (PERIOD * 1000 - t) : 1;
-    delay(t);
+    if (ipaddr){
+      SerialMon.println(" connect");
+      (ambient.send())? Serial.println("send ok") : Serial.println("send error");
+     
+    
+      if (spd){
+        period = 300 / spd;
+      }else{
+        period = 600; //10min
+      }
+      period = constrain(period ,5 ,600);
+      SerialMon.println(period);
+      M5.Lcd.print(period);
+      t = millis() - t;
+      t = (t < period * 1000) ? (period * 1000 - t) : 1;
+      delay(t);
+    }
 }
