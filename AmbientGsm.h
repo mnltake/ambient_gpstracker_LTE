@@ -1,6 +1,7 @@
 /*
  * ambient.h - Library for sending data to Ambient
  * Created by Takehiko Shimojima, April 21, 2016
+ * change by mnltake ,2022
  */
 #ifndef AmbientGsm_h
 #define AmbientGsm_h
