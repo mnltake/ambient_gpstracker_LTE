@@ -1,6 +1,7 @@
 /*
  * ambient.cpp - Library for sending data to Ambient
  * Created by Takehiko Shimojima, April 21, 2016
+ * change by mnltake ,2022
  */
 #include "AmbientGsm.h"
 
