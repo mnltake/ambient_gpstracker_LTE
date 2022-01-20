@@ -1,10 +1,6 @@
 # ambient_gpstracker_LTE
- M5stickC + CAT-M UNIT + povo +GPS receiver -> ambidata.io
+ M5stickC + CAT-M UNIT + povo +ublox M8P(F9P) + ntrip -> ambidata.io
+ 
+ ##SparkFun_u-blox_GNSS_Arduino_Library
 
-TinyGPSPlus
-
-#include <TinyGPSPlus.h>
-https://github.com/Tinyu-Zhao/TinyGPSPlus-ESP32
-
-#include <TinyGPS++.h>
-https://github.com/mikalhart/TinyGPSPlus
+https://ambient.bulk_sendgithub.com/sparkfun/SparkFun_u-blox_GNSS_Arduino_Library
