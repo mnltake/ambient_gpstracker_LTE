@@ -1,5 +1,8 @@
 # ambient_gpstracker_LTE
- M5stickC + CAT-M UNIT + povo +ublox M8P(F9P) + ntrip -> ambidata.io
+
+ M5stack(m5stack-core-esp32) + CAT-M UNIT + povo +UBLOX Neo-M8P +stackchanPCB -> ambidata.io
+
+
  
  ##SparkFun_u-blox_GNSS_Arduino_Library
 

@@ -1,6 +1,4 @@
 /*
-  modify from
-  https://github.com/sparkfun/SparkFun_u-blox_GNSS_Arduino_Library/tree/main/examples/ZED-F9P/Example16_NTRIPClient_WithGGA
   Use ESP32 WiFi to get RTCM data from RTK2Go (caster) as a Client, and transmit GGA (needed for some Casters)
   By: SparkFun Electronics / Nathan Seidle
   Date: November 18th, 2021
@@ -39,28 +37,44 @@
   Open the serial monitor at 115200 baud to see the output
 */
 
+//#include <WiFi.h>
+
+#define SerialMon Serial
 #define SerialGPS Serial1
 #define SerialAT Serial2
+// #define DUMP_AT_COMMANDS
+// #define TINY_GSM_DEBUG Serial
+
 #define TINY_GSM_RX_BUFFER 650
 #define TINY_GSM_MODEM_SIM7080
 #include <TinyGsmClient.h>
-TinyGsm modem(SerialAT); /* LTE board modem */
-TinyGsmClient ntripClient(modem);
+TinyGsm modem(SerialAT); /* LTE-M modem */
+TinyGsmClient ntripClient(modem, 0);
+TinyGsmClient ambientClient(modem, 1);
+TinyGsmClientSecure geoidClient(modem, 2);
 #include "secrets.h"
-#include <M5StickC.h>
 //#include <M5Stack.h>
 #include <SparkFun_u-blox_GNSS_Arduino_Library.h> //http://librarymanager/All#SparkFun_u-blox_GNSS
 SFE_UBLOX_GNSS myGNSS;
 
 #include "AmbientGsm.h"
 Ambient ambient;
+#include <ArduinoHttpClient.h>
+HttpClient    http(geoidClient,"vldb.gsi.go.jp" , 443); //https://vldb.gsi.go.jp/sokuchi/surveycalc/api_help.html
+#include <ArduinoJson.h>
+#include "base64.h"
+#include <TimeLib.h>  
+#include <Avatar.h>
+using namespace m5avatar;
+Avatar avatar;
 
-#include "base64.h" //Built-in ESP32 library
+#define E7 10000000.0
+#define E3 1000.0
+#include "esp_system.h"
+
 
 //Global variables
 //=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
-#define E7 10000000.0
-#define E3 1000.0
 long lastReceivedRTCM_ms = 0;       //5 RTCM messages take approximately ~300ms to arrive at 115200bps
 int maxTimeBeforeHangup_ms = 10000; //If we fail to get a complete RTCM frame after 10s, then disconnect from caster
 
@@ -76,61 +90,184 @@ bool ggaTransmitComplete = false; //Goes true once we transmit GGA to the caster
 char ggaSentence[128] = {0};
 byte ggaSentenceSpot = 0;
 int ggaSentenceEndSpot = 0;
-
-int ambientcnt=1;
-const int ambientSendPeriod = 10;
-#define AMBUFSIZE  1500
+unsigned int ambientcnt=0;
+const int ambientSendPeriod =8;
+#define AMBUFSIZE  1460
 char ambuffer[AMBUFSIZE];
+ColorPalette* cps[4];
+bool isGetgeoid = false;
+float  geoid;
+const int wdtTimeout = 20000;  //time in ms to trigger the watchdog
+hw_timer_t *timer = NULL;
 //=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 
 void beginClient();
 
-void setup()
-{
-  M5.begin();
- // dacWrite(25, 0);  // M5stack speaker off
-  
-  M5.Axp.ScreenBreath(10); 
-  M5.Lcd.setTextColor(WHITE);
-  M5.Lcd.setRotation(3);//stickC
-  M5.Lcd.setTextSize(1);
-//  M5.Lcd.setTextSize(3);// M5stack 
-  M5.Lcd.setCursor(0,0);
-  Serial.println(F("Start "));
+double localGeoid(double _lng_mdeg){
+  return (_lng_mdeg * 4.3144 -552.65*E7)/10000.0;
+} 
 
-  while (!myGNSS.begin(SerialGPS)) {
-    SerialGPS.begin(115200, SERIAL_8N1, 36, 26);
-    Serial.print(".");delay(100);
+float getJapanGeoid(){
+  char latbuf[12], lngbuf[12],geobuf[8],request[200];
+  dtostrf(myGNSS.getLatitude()/ E7, -1, 8, latbuf);
+  dtostrf(myGNSS.getLongitude() / E7, -1, 8, lngbuf);
+  sprintf(request,"/sokuchi/surveycalc/geoid/calcgh/cgi/geoidcalc.pl?outputType=json&latitude=%s&longitude=%s",latbuf,lngbuf);
+  // Serial.println(request);
+  SerialMon.print(F("Performing HTTP GET request... "));
+  int err = http.get(request);
+  if (err != 0) {
+    SerialMon.println(F("failed to connect"));
+    delay(10000);
+    isGetgeoid = false;
+    return 0.0;
   }
 
-  Serial.println("GNSS serial connected");
+  int status = http.responseStatusCode();
+  SerialMon.print(F("Response status code: "));
+  SerialMon.println(status);
+  if (!status) {
+    delay(10000);
+    isGetgeoid = false;
+    return 0.0;
+  }
 
-  myGNSS.setUART1Output(COM_TYPE_UBX | COM_TYPE_NMEA);                                //Set the UART1 port to output both NMEA and UBX messages
+  SerialMon.println(F("Response Headers:"));
+  while (http.headerAvailable()) {
+    String headerName  = http.readHeaderName();
+    String headerValue = http.readHeaderValue();
+    // SerialMon.println("    " + headerName + " : " + headerValue);
+  }
+
+  int length = http.contentLength();
+  if (length >= 0) {
+    SerialMon.print(F("Content length is: "));
+    SerialMon.println(length);
+  }
+  if (http.isResponseChunked()) {
+    SerialMon.println(F("The response is chunked"));
+  }
+
+  String body = http.responseBody();
+  SerialMon.println(F("Response:"));
+  SerialMon.println(body);
+
+  SerialMon.print(F("Body length is: "));
+  SerialMon.println(body.length());
+
+  // Allocate the JSON document
+  // Use https://arduinojson.org/v6/assistant to compute the capacity.
+  // const size_t capacity = JSON_OBJECT_SIZE(3) + JSON_ARRAY_SIZE(2) + 60;
+  DynamicJsonDocument doc(192);
+  // Parse JSON object
+  DeserializationError error = deserializeJson(doc, body);
+
+  if (error) {
+    Serial.print("deserializeJson() failed: ");
+    Serial.println(error.c_str());
+    isGetgeoid = false;
+    return 0.0;
+  }
+
+  JsonObject OutputData = doc["OutputData"];
+  // const char* OutputData_latitude = OutputData["latitude"]; // "34.953764000"
+  // const char* OutputData_longitude = OutputData["longitude"]; // "136.935113500"
+  const char* OutputData_geoidHeight = OutputData["geoidHeight"]; // "38.1422"
+  Serial.println(OutputData_geoidHeight);
+  isGetgeoid = true;
+  return atof(OutputData_geoidHeight)*E3;
+
+  // Disconnect
+  // geoidClient.stop();
+
+
+}
+
+void IRAM_ATTR resetModule() {
+  ets_printf("WDT reboot\n");
+  ntripClient.stop();
+  ambientClient.stop();
+  geoidClient.stop();
+  esp_restart();
+}
+
+void setup()
+{
+  M5.begin(true, true, true, false); 
+  dacWrite(25, 0);  // speaker off
+  #ifdef DUMP_AT_COMMANDS
+    #include <StreamDebugger.h>
+    StreamDebugger debugger(SerialAT, SerialMon);
+    TinyGsm modem(debugger);
+  #else
+    TinyGsm modem(SerialAT);
+  #endif
+    //watchdog timer
+  timer = timerBegin(0, 80, true);                  //timer 0, div 80
+  timerAttachInterrupt(timer, &resetModule, true);  //attach callback
+  timerAlarmWrite(timer, wdtTimeout * 1000, false); //set time in us
+  timerAlarmEnable(timer);                          //enable interrupt
+
+  avatar.init(); // start drawing
+  cps[0] = new ColorPalette();
+  cps[1] = new ColorPalette();
+  cps[2] = new ColorPalette();
+  cps[3] = new ColorPalette();
+  cps[1]->set(COLOR_PRIMARY, TFT_ORANGE);
+  cps[1]->set(COLOR_BACKGROUND, TFT_BLACK);
+  cps[2]->set(COLOR_PRIMARY, TFT_GREEN);
+  cps[2]->set(COLOR_BACKGROUND, TFT_BLACK);
+  cps[3]->set(COLOR_PRIMARY, TFT_RED);
+  cps[3]->set(COLOR_BACKGROUND, TFT_BLACK);
+  avatar.setColorPalette(*cps[0]);
+  avatar.setSpeechText("Starting..");
+  // // // M5.Lcd.setTextSize(3);
+  // // // M5.Lcd.setCursor(0,0);
+  Serial.println(F("NTRIP start"));
+  SerialGPS.begin(115200, SERIAL_8N1, 36, 26);
+  
+  delay(300);
+  while (!myGNSS.begin(SerialGPS)) {
+    Serial.print(".");delay(100);
+  }
+  timerWrite(timer, 0);
+  Serial.println("GNSS serial connected");
+  myGNSS.setUART1Output(COM_TYPE_UBX);                                //Set the UART1 port to output both NMEA and UBX messages
   myGNSS.setPortInput(COM_PORT_UART1, COM_TYPE_UBX | COM_TYPE_NMEA | COM_TYPE_RTCM3); //Be sure RTCM3 input is enabled. UBX + RTCM3 is not a valid state.
   myGNSS.setHighPrecisionMode(true); // Enable High Precision Mode - include extra decimal places in the GGA messages
   //myGNSS.enableNMEAMessage(UBX_NMEA_GGA, COM_PORT_UART1); //Verify the GGA sentence is enabled
  // myGNSS.setAutoPVT(true);
   myGNSS.setNavigationFrequency(1); //Set output in Hz.
-  //SerialAT.begin(115200, SERIAL_8N1, 16, 17);// M5stack 
-  SerialAT.begin(115200, SERIAL_8N1, 33, 32);//stickC
+  myGNSS.setMeasurementRate(1000); //Produce a measurement every 1000ms
+  myGNSS.setNavigationRate(1); //Produce a navigation solution every measurement
+  myGNSS.setAutoPVTrate(1); //Tell the GNSS to send the PVT solution every measurement
+  avatar.setSpeechText("Connect..");
+  SerialAT.begin(115200, SERIAL_8N1, 17, 16);
+  delay(1800);
+  timerWrite(timer, 0);
+  modem.sendAT();modem.sendAT();modem.sendAT();
   modem.restart();
   String modemInfo = modem.getModemInfo();
   Serial.println( modemInfo );
-  Serial.print( "modem connecting " );Serial.println( apn );
+  avatar.setMouthOpenRatio(0.5);
+  Serial.print( "connecting " );Serial.println( apn );
+  timerWrite(timer, 0);
   while (!modem.waitForNetwork()) Serial.print(".");
   modem.gprsConnect(apn, gprsUser, gprsPass);
   while (!modem.isNetworkConnected()) Serial.print(".");
   IPAddress ipaddr = modem.localIP();
   Serial.println( ipaddr );
+  avatar.setMouthOpenRatio(0.0);
+   // // // M5.Lcd.println( ipaddr);
 
-  ambient.begin(channelId, writeKey, & ntripClient);
+  ambient.begin(channelId, writeKey, &ambientClient);
   sprintf(ambuffer, "{\"writeKey\":\"%s\",\"data\":[", writeKey);
 }
 
 void loop(){
+  timerWrite(timer, 0);
   beginClient();
-
-  delay(10);
+  delay(5);
+   
 }
 
 //Connect to NTRIP Caster, receive RTCM, and push to ublox module over UART1
@@ -139,7 +276,7 @@ void beginClient()
 //  WiFiClient ntripClient;
   long rtcmCount = 0;
   myGNSS.checkUblox();
-
+  avatar.setMouthOpenRatio(0.0);
   //Connect if we are not already. Limit to 5s between attempts.
   if (ntripClient.connected() == false)
   {
@@ -161,7 +298,7 @@ void beginClient()
       Serial.print(F("Requesting NTRIP Data from mount point "));
       Serial.println(mountPoint);
 
-      const int SERVER_BUFFER_SIZE = 512;
+      size_t SERVER_BUFFER_SIZE = 512;
       char serverRequest[SERVER_BUFFER_SIZE];
 
       snprintf(serverRequest,
@@ -260,20 +397,21 @@ void beginClient()
   {
     uint8_t rtcmData[512 * 4]; //Most incoming data is around 500 bytes but may be larger
     rtcmCount = 0;
-
+    
     //Print any available RTCM data
     while (ntripClient.available())
     {
       //Serial.write(ntripClient.read()); //Pipe to serial port is fine but beware, it's a lot of binary data
+      avatar.setMouthOpenRatio(0.7);
       rtcmData[rtcmCount++] = ntripClient.read();
       if (rtcmCount == sizeof(rtcmData))
         break;
     }
-
+    avatar.setMouthOpenRatio(0.0);
     if (rtcmCount > 0)
     {
     // lastReceivedRTCM_ms = millis();
-
+     
       //Push RTCM to GNSS module over I2C
       myGNSS.pushRawData(rtcmData, rtcmCount, false);
       Serial.print(F("RTCM pushed to Ublox: "));
@@ -285,126 +423,121 @@ void beginClient()
       if ( spanMillis > 0 ){
         int bps = rtcmCount * 8 * 1000 / spanMillis;
         lastReceivedRTCM_ms = milis;
-//        M5.Lcd.setCursor(0,25);
-//        M5.Lcd.printf("NTRIP=%05d bps\r\n", bps );
+        // // M5.Lcd.setCursor(0,25);
+        // // M5.Lcd.printf("NTRIP=%05d bps\r\n", bps );
         }
     }
   }
-
+  
   //Provide the caster with our current position as needed
-  if (ntripClient.connected() == true && transmitLocation == true && (millis() - lastTransmittedGGA_ms) > timeBetweenGGAUpdate_ms && ggaSentenceComplete == true && ggaTransmitComplete == false)
+  if (ntripClient.connected() == true && transmitLocation == true && (millis() - lastTransmittedGGA_ms) > timeBetweenGGAUpdate_ms)// && ggaSentenceComplete == true && ggaTransmitComplete == false)
   {
-    Serial.print(F("Pushing GGA to server: "));
-    Serial.println(ggaSentence);
-    char latbuf[12], lngbuf[12],altbuf[8],spdbuf[7];
-
-    if (myGNSS.getPVT() && myGNSS.getHighResLatitude() ){
-        double latitude_mdeg =myGNSS.getHighResLatitude();
-        double longitude_mdeg = myGNSS.getHighResLongitude();
-       // double alt = myGNSS.getAltitude();
-        double altMSL = myGNSS.getAltitudeMSL();
+    lastTransmittedGGA_ms = millis();
+    ggaTransmitComplete = true;
+    char latbuf[12], lngbuf[12],altbuf[8],spdbuf[7],avatartalk[20],altMSLbuf[8],geoidbuf[8],innergeoidbuf[8];
+    M5.update();
+    if (myGNSS.getPVT() && ((myGNSS.getLatitude() > 34*E7) && (myGNSS.getLatitude() < 38*E7)) ){
+        double latitude_mdeg =myGNSS.getLatitude();
+        double longitude_mdeg = myGNSS.getLongitude();
+        double alt = myGNSS.getAltitude();
+        double inner_altMSL = myGNSS.getAltitudeMSL();
+        
+        if (!isGetgeoid){
+          geoid = localGeoid(longitude_mdeg);
+        } 
+        double altMSL = alt-geoid;
+        double innner_geoid = alt - inner_altMSL;
         double speed = myGNSS.getGroundSpeed() ;
-       // int fixType = myGNSS.getFixType();  //0=no fix, 1=dead reckoning, 2=2D, 3=3D, 4=GNSS, 5=Time fix
+        int fixType = myGNSS.getFixType();  //0=no fix, 1=dead reckoning, 2=2D, 3=3D, 4=GNSS, 5=Time fix
         int rtk = myGNSS.getCarrierSolutionType(); //0=No solution, 1=Float solution, 2=Fixed solution}
-      
-        M5.Lcd.fillScreen(BLACK);//stickC
-//        M5.Lcd.clear();// M5stack 
-        M5.Lcd.setCursor(0,0);
-        // M5.Lcd.print(ggaSentence);
-        M5.Lcd.println( modem.localIP());
-        M5.Lcd.println("Latitude (deg): ");
-        M5.Lcd.println(latitude_mdeg / E7, 7);
-        M5.Lcd.println("Longitude (deg): ");
-        M5.Lcd.println(longitude_mdeg / E7, 7);
-        M5.Lcd.print("AltMSL(m):");
-        M5.Lcd.println(altMSL/E3 , 3);
-        M5.Lcd.print("Speed(m/s):");
-        M5.Lcd.println(speed / E3, 1);
-        M5.Lcd.print("RTK: ");
-        switch (rtk)
-        {
-        case 1/* constant-expression */:
-          M5.Lcd.println("Float");
-          break;
-        case 2/* constant-expression */:
-          M5.Lcd.println("  Fix");
-          break;
-        default:
-          M5.Lcd.println("NORTK");
-          break;
+          //local time set  
+        int YYYY=myGNSS.getYear();
+        int MM = myGNSS.getMonth();
+        int DD = myGNSS.getDay();
+        int HH = myGNSS.getHour();
+        int mm = myGNSS.getMinute();
+        int ss = myGNSS.getSecond();
+        setTime(HH, mm, ss, DD, MM, YYYY);
+        adjustTime(+9 * SECS_PER_HOUR);
+        dtostrf(longitude_mdeg / E7, -1, 7, lngbuf);
+        dtostrf(latitude_mdeg/ E7, -1, 7, latbuf);
+        dtostrf(alt/E3, -1 ,2, altbuf);
+        dtostrf(altMSL/E3, -1 ,2, altMSLbuf);
+        dtostrf(speed /E3, -1 ,2, spdbuf);
+        dtostrf(geoid/E3, -1 ,2, geoidbuf);
+        dtostrf(innner_geoid/E3, -1 ,2, innergeoidbuf);
+        //YYYY-MM-DD HH:mm:ss.sss”
+        char datebuf[25];
+        sprintf(datebuf,"%04d-%02d-%02d %02d:%02d:%02d",
+            year(),month(),day(),hour(),minute(),second());
+ 
+        if (ambientcnt){ //最初の一回目は使わない
+        sprintf(&ambuffer[strlen(ambuffer)], "{\"created\":\"%s\",\"d1\":\"%s\",\"d2\":\"%s\",\"d3\":\"%d\",\"d5\":\"%d\",\"d6\":\"%s\",\"d7\":\"%s\",\"d8\":\"%s\",\"lat\":\"%s\",\"lng\":\"%s\"},",
+                        datebuf ,altMSLbuf,spdbuf,ambientcnt,rtk,altbuf,geoidbuf,innergeoidbuf,latbuf,lngbuf);
         }
-        M5.Lcd.println(ambientcnt);
+        // synchronizeAllServosStartAndWaitForAllServosToStop();
 
-        
-        dtostrf(longitude_mdeg / E7, 11, 7, lngbuf);
-        dtostrf(latitude_mdeg/ E7, 11, 7, latbuf);
-        dtostrf(altMSL/E3, 7 ,2, altbuf);
-        dtostrf(speed /E3, 6 ,2, spdbuf);
-        char datebuf[25];//"YYYY-MM-DD HH:mm:ss.sss”
-        sprintf(datebuf,"%04d-%02d-%02d %02d:%02d:%02d.%03d",
-          myGNSS.getYear(),myGNSS.getMonth(),myGNSS.getDay(),myGNSS.getHour(),myGNSS.getMinute(),myGNSS.getSecond(),myGNSS.getMillisecond());
-        sprintf(&ambuffer[strlen(ambuffer)], "{\"created\":\"%s\",\"d1\":\"%s\",\"d2\":\"%s\",\"d5\":\"%d\",\"lat\":\"%s\",\"lng\":\"%s\"},",
-                        datebuf ,altbuf,spdbuf,rtk,latbuf,lngbuf);
-        
+        if (M5.BtnA.wasPressed()){
+          sprintf(avatartalk,"Lat%s" , latbuf);
+        }else if (M5.BtnB.wasPressed()){
+          sprintf(avatartalk,"Lng%s" , lngbuf);
+        }else if (M5.BtnC.wasPressed()){
+          Serial.println("get japan geoid");
+          geoid = getJapanGeoid();
+          sprintf(avatartalk,"Get geoid%.2f" ,geoid/E3);
+        }else{
+        sprintf(avatartalk,"AltMSL%sm" , altMSLbuf);
+        // sprintf(avatartalk,"SoracomUG" );
+        }
+        avatar.setSpeechText(avatartalk);
+        if (!isGetgeoid){
+          avatar.setColorPalette(*cps[3]);
+        }else{
+          switch (rtk)
+          {
+          case 1/* constant-expression */:
+            avatar.setColorPalette(*cps[1]);
+            // // M5.Lcd.println("Float");
+            break;
+          case 2/* constant-expression */:
+            avatar.setColorPalette(*cps[2]);
+            // // M5.Lcd.println("  Fix");
+            break;
+          default:
+            // // M5.Lcd.println("NORTK");
+            avatar.setColorPalette(*cps[0]);
+            break;
+          }
+        }
     }
-    if (ambientcnt >= ambientSendPeriod){
+    // if (ambientcnt > ambientSendPeriod){
+    if (((ambientcnt % ambientSendPeriod) == 0)&& ambientcnt ){
       ambuffer[strlen(ambuffer)-1] = '\0';
       sprintf(&ambuffer[strlen(ambuffer)], "]}\r\n");
-      //Serial.write(ambuffer,strlen(ambuffer));
-      int r = ambient.bulk_send(ambuffer);
-      //Serial.println(r);
+      Serial.write(ambuffer,strlen(ambuffer));
+      avatar.setMouthOpenRatio(1.0);
+      int r = ambient.bulk_send(ambuffer,5000);
+      avatar.setMouthOpenRatio(0.0);
+      Serial.println(r);
       if (r){
-        ambientcnt=1;
+        ambientcnt++;
         Serial.println("ambient send");
+        avatar.setSpeechText("SendData");
         sprintf(ambuffer, "{\"writeKey\":\"%s\",\"data\":[", writeKey);
         return;
       }else{
         Serial.println("Ambient send error");
+        ambientcnt--;
         return;
       }
+
     }else{
+      if (ambientcnt %60 == 1){
+        timerWrite(timer, 0);
+        geoid = getJapanGeoid();
+      }
       ambientcnt++;
     }
-    lastTransmittedGGA_ms = millis();
-//Push our current GGA sentence to caster
-//      ntripClient.print(ggaSentence);
-//      ntripClient.print("\r\n");
-    ggaTransmitComplete = true;
-    //Wait for response
-    unsigned long timeout = millis();
-    while (ntripClient.available() == 0)
-    {
-      if (millis() - timeout > 5000)
-      {
-        Serial.println(F("Caster timed out!"));
-        ntripClient.stop();
-        return;
-      }
-      delay(10);
-    }
-
-    //Check reply
-    bool connectionSuccess = false;
-    char response[512];
-    int responseSpot = 0;
-    while (ntripClient.available())
-    {
-      if (responseSpot == sizeof(response) - 1)
-        break;
-
-      response[responseSpot++] = ntripClient.read();
-      if (strstr(response, "200") > 0) //Look for '200 OK'
-        connectionSuccess = true;
-      if (strstr(response, "401") > 0) //Look for '401 Unauthorized'
-      {
-        Serial.println(F("Hey - your credentials look bad! Check you caster username and password."));
-        connectionSuccess = false;
-      }
-    }
-    response[responseSpot] = '\0';
-
-    Serial.print(F("Caster responded with: "));
-    Serial.println(response);
   }
 
   //Close socket if we don't have new data for 10s
@@ -415,55 +548,6 @@ void beginClient()
       ntripClient.stop();
     return;
   }
+
   delay(10);
-}
-
-//This function gets called from the SparkFun u-blox Arduino Library
-//As each NMEA character comes in you can specify what to do with it
-//We will look for and copy the GGA sentence
-void SFE_UBLOX_GNSS::processNMEA(char incoming)
-{
-  //Take the incoming char from the u-blox UART and check to see if we should record it or not
-  if (incoming == '$' && ggaTransmitComplete == true)
-  {
-    ggaSentenceStarted = true;
-    ggaSentenceSpot = 0;
-    ggaSentenceEndSpot = sizeof(ggaSentence);
-    ggaSentenceComplete = false;
-  }
-
-  if (ggaSentenceStarted == true)
-  {
-    ggaSentence[ggaSentenceSpot++] = incoming;
-
-    //Make sure we don't go out of bounds
-    if (ggaSentenceSpot == sizeof(ggaSentence))
-    {
-      //Start over
-      ggaSentenceStarted = false;
-    }
-    //Verify this is the GGA setence
-    else if (ggaSentenceSpot == 5 && incoming != 'G')
-    {
-      //Ignore this sentence, start over
-      ggaSentenceStarted = false;
-    }
-    else if (incoming == '*')
-    {
-      //We're near the end. Keep listening for two more bytes to complete the CRC
-      ggaSentenceEndSpot = ggaSentenceSpot + 2;
-    }
-    else if (ggaSentenceSpot == ggaSentenceEndSpot)
-    {
-      ggaSentence[ggaSentenceSpot] = '\0'; //Terminate this string
-      ggaSentenceComplete = true;
-      ggaTransmitComplete = false; //We are ready for transmission
-
-      //Serial.print("GGA Parsed - ");
-      //Serial.println(ggaSentence);
-
-      //Start over
-      ggaSentenceStarted = false;
-    }
-  }
 }

@@ -13,3 +13,10 @@ const char* writeKey = "write key"; // ライトキー
 const char apn[] = "povo.jp";
 const char gprsUser[] = "";
 const char gprsPass[] = "";
+
+// point search
+#define POINTLAT 34.0000000
+#define POINTLNG 136.0000000
+#define DIFF 0.000001
+
+//#define USESERVO 
